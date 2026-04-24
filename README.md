@@ -13,7 +13,7 @@ Replication health monitoring for eFiche's PostgreSQL logical replication fleet.
 | `ops_agent/middleware.py` | Deliverable 1d — two-tier API key security |
 | `ANALYSIS.md` | Deliverables 1a–1d — written analysis and security memo |
 | `DESIGN_DOCUMENT.md` | Deliverable 3 — RPi strategy, migration protocol, automation limits |
-| `.gitlab-ci.improved.yml` | Deliverable 1c — improved CI pipeline (GitLab CI syntax, for eFiche's backend) |
+| `.gitlab-ci.improved.yml` | Deliverable 1c — CI/CD pipeline (GitLab CI syntax, for eFiche's Laravel backend) |
 | `.github/workflows/ci.yml` | GitHub Actions — runs tests and validates deliverables on every push |
 | `tests/test_replication_health.py` | Deliverable 2 — unit and integration tests |
 
@@ -43,7 +43,7 @@ Replication health monitoring for eFiche's PostgreSQL logical replication fleet.
 ├── .env.example
 ├── ANALYSIS.md                  # Written analysis: deliverables 1a–1d
 ├── DESIGN_DOCUMENT.md           # Design document: deliverable 3
-├── .gitlab-ci.improved.yml      # Improved CI pipeline (GitLab CI): deliverable 1c
+├── .gitlab-ci.improved.yml      # CI/CD pipeline (GitLab CI): deliverable 1c
 ├── .github/
 │   └── workflows/
 │       └── ci.yml               # GitHub Actions: runs tests + validates deliverables
@@ -59,12 +59,12 @@ This repository has two pipeline files — they serve different purposes:
 | File | Purpose |
 |------|---------|
 | `.github/workflows/ci.yml` | **Runs on this repo** — executes the 26 tests, validates the migration SQL, and validates the improved GitLab CI file on every push to GitHub |
-| `.gitlab-ci.improved.yml` | **Answer to deliverable 1c** — the improved pipeline eFiche should adopt for their Laravel backend on their GitLab instance |
+| `.gitlab-ci.improved.yml` | **Deliverable 1c** — CI/CD pipeline for eFiche's Laravel backend on their GitLab instance |
 
 The GitHub Actions pipeline runs three jobs on every push:
 
 - **Unit & Integration Tests** — all 26 pytest tests (trend logic, degraded flag, Redis storage, endpoint integration)
-- **Validate Improved CI Pipeline** — confirms `.gitlab-ci.improved.yml` defines all 7 required jobs across the correct stages
+- **Validate CI Pipeline** — confirms `.gitlab-ci.improved.yml` defines all 7 required jobs across the correct stages
 - **Validate Migration SQL** — confirms `migrations/add_billing_status.sql` contains all three steps including `NOT VALID`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, and `SKIP LOCKED`
 
 ---

@@ -37,7 +37,7 @@ jobs:
   # and has all required jobs defined.
   # -----------------------------------------------------------------------
   validate-ci-pipeline:
-    name: Validate Improved CI Pipeline
+    name: Validate CI Pipeline
     runs-on: ubuntu-latest
 
     steps:
@@ -48,6 +48,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install pyyaml
+        run: pip install pyyaml
 
       - name: Validate .gitlab-ci.improved.yml structure
         run: |
