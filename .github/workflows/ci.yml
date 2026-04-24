@@ -1,0 +1,134 @@
+name: eFiche Ops Agent CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Job 1: Run all unit and integration tests
+  # This is the core deliverable — proves the /replication-health endpoint,
+  # trend logic, degraded flag, and Redis storage all work correctly.
+  # -----------------------------------------------------------------------
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: PYTHONPATH=. pytest tests/ -v --tb=short
+
+  # -----------------------------------------------------------------------
+  # Job 2: Validate that the improved GitLab CI pipeline file is valid YAML
+  # and has all required jobs defined.
+  # -----------------------------------------------------------------------
+  validate-ci-pipeline:
+    name: Validate Improved CI Pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate .gitlab-ci.improved.yml structure
+        run: |
+          python3 - <<'EOF'
+          import yaml, sys
+
+          with open(".gitlab-ci.improved.yml") as f:
+              pipeline = yaml.safe_load(f)
+
+          required_jobs = [
+              "php_syntax_check",
+              "phpstan",
+              "migration_check",
+              "config_validation",
+              "docker_build",
+              "docker_size_check",
+              "deploy_production",
+          ]
+
+          required_stages = ["lint", "build", "deploy"]
+
+          print("Checking stages...")
+          for stage in required_stages:
+              assert stage in pipeline["stages"], f"Missing stage: {stage}"
+              print(f"  [OK] stage: {stage}")
+
+          print("Checking jobs...")
+          for job in required_jobs:
+              assert job in pipeline, f"Missing job: {job}"
+              assert "stage" in pipeline[job], f"Job {job} has no stage"
+              assert "script" in pipeline[job], f"Job {job} has no script"
+              print(f"  [OK] job: {job} (stage: {pipeline[job]['stage']})")
+
+          print()
+          print("All checks passed. Pipeline is valid.")
+          EOF
+
+  # -----------------------------------------------------------------------
+  # Job 3: Verify the migration SQL file has all three required steps
+  # -----------------------------------------------------------------------
+  validate-migration:
+    name: Validate Migration SQL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check migration has all three steps
+        run: |
+          python3 - <<'EOF'
+          import sys
+
+          with open("migrations/add_billing_status.sql") as f:
+              content = f.read()
+
+          checks = [
+              ("Step 1 - ADD COLUMN nullable",
+               "ADD COLUMN" in content and "NULL" in content),
+              ("Step 2 - Batch backfill loop",
+               "LOOP" in content and "billing_status" in content and "pg_sleep" in content),
+              ("Step 3 - NOT VALID constraint",
+               "NOT VALID" in content),
+              ("Step 3 - VALIDATE CONSTRAINT",
+               "VALIDATE CONSTRAINT" in content),
+              ("Step 3 - SET NOT NULL",
+               "SET NOT NULL" in content),
+              ("FOR UPDATE SKIP LOCKED (safe backfill)",
+               "SKIP LOCKED" in content),
+          ]
+
+          all_passed = True
+          for name, condition in checks:
+              status = "OK" if condition else "FAIL"
+              print(f"  [{status}] {name}")
+              if not condition:
+                  all_passed = False
+
+          if not all_passed:
+              print("\nMigration is missing required steps.")
+              sys.exit(1)
+
+          print("\nAll migration checks passed.")
+          EOF

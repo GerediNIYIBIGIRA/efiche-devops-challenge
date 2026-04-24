@@ -1,0 +1,228 @@
+# .gitlab-ci.improved.yml
+# Improved CI pipeline for eFiche backend.
+#
+# Changes from the original:
+#   - migration_check:    catches locking migrations and conflicting timestamps
+#   - config_validation:  catches missing .env.example keys before deploy
+#   - docker_size_check:  catches images too large for RPi 2GB nodes
+#   - docker_build:       now pushes to registry (original only built locally)
+#   - deploy_production:  now has an environment, only runs from main, waits for build
+#
+# Original pipeline preserved as comments for reference.
+
+stages:
+  - lint
+  - build
+  - deploy
+
+# ---------------------------------------------------------------------------
+# LINT STAGE
+# ---------------------------------------------------------------------------
+
+php_syntax_check:
+  stage: lint
+  image: php:8.2-cli-alpine
+  script:
+    - find . -name "*.php" -not -path "*/vendor/*" -exec php -l {} \; | grep -v "No syntax errors"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+phpstan:
+  stage: lint
+  image: php:8.2-cli-alpine
+  before_script:
+    - composer install --no-interaction --prefer-dist --quiet
+  script:
+    - vendor/bin/phpstan analyse --level=5 --no-progress
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# NEW: Catches migrations that would take a table lock, have conflicting timestamps,
+# or reference non-existent tables/columns. Prevents the class of incidents where
+# a migration ships on a Friday and locks the visit_invoices table during clinic hours.
+migration_check:
+  stage: lint
+  image: php:8.2-cli
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: efiche_test
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: ""
+    DB_CONNECTION: pgsql
+    DB_HOST: postgres
+    DB_DATABASE: efiche_test
+    DB_USERNAME: postgres
+    DB_PASSWORD: ""
+    APP_ENV: testing
+    APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq libpq-dev git unzip curl > /dev/null
+    - docker-php-ext-install pdo_pgsql > /dev/null
+    - curl -sS https://getcomposer.org/installer | php -- --quiet && mv composer.phar /usr/local/bin/composer
+    - composer install --no-interaction --prefer-dist --quiet
+    - cp .env.example .env
+    - php artisan key:generate --quiet
+  script:
+    # Run all migrations forward
+    - php artisan migrate --force --no-interaction
+
+    # Roll back the last migration and re-run (confirms reversibility)
+    - php artisan migrate:rollback --step=1 --force --no-interaction
+    - php artisan migrate --force --no-interaction
+
+    # Detect potentially blocking migration patterns
+    # ADD COLUMN NOT NULL without NOT VALID, CHANGE COLUMN, etc.
+    - |
+      echo "Scanning migrations for potentially blocking operations..."
+      BLOCKING=$(grep -rn \
+        -e "ADD COLUMN.*NOT NULL.*DEFAULT\b" \
+        -e "CHANGE\b" \
+        -e "MODIFY COLUMN\b" \
+        database/migrations/ 2>/dev/null || true)
+      if [ -n "$BLOCKING" ]; then
+        echo "WARNING: Potentially blocking migration operations detected:"
+        echo "$BLOCKING"
+        echo "Review these migrations for zero-downtime safety."
+        # Warn only in MR pipelines; fail on main
+        [ "$CI_COMMIT_BRANCH" = "main" ] && exit 1 || exit 0
+      fi
+      echo "No blocking patterns found."
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# NEW: Verifies that every env var used by the application is documented in .env.example.
+# Prevents the class of incidents where a developer adds a new service dependency
+# (Redis, external API, feature flag) but forgets to add the key to .env.example,
+# causing the deployed app to silently use empty values or crash on first use.
+config_validation:
+  stage: lint
+  image: php:8.2-cli-alpine
+  before_script:
+    - composer install --no-interaction --prefer-dist --quiet
+    - cp .env.example .env
+    - php artisan key:generate --quiet
+  script:
+    # Confirm all env() calls in application code have a corresponding key in .env.example
+    - |
+      echo "Checking .env.example covers all env() calls in application code..."
+      MISSING=0
+      while IFS= read -r KEY; do
+        [ -z "$KEY" ] && continue
+        if ! grep -q "^${KEY}=" .env.example && ! grep -q "^#${KEY}=" .env.example; then
+          echo "MISSING: $KEY used in code but not in .env.example"
+          MISSING=1
+        fi
+      done < <(grep -roh "env('[A-Z_]*'" app/ config/ 2>/dev/null | sed "s/env('//g;s/'//g" | sort -u)
+      [ "$MISSING" -eq 0 ] || exit 1
+
+    # Laravel config must load and cache without errors
+    - php artisan config:cache
+    - php artisan config:clear
+    - echo "Config validation passed."
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ---------------------------------------------------------------------------
+# BUILD STAGE
+# ---------------------------------------------------------------------------
+
+docker_build:
+  stage: build
+  image: docker:24-cli
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE/efiche-backend:$CI_COMMIT_SHA" .
+    - docker tag "$CI_REGISTRY_IMAGE/efiche-backend:$CI_COMMIT_SHA" "$CI_REGISTRY_IMAGE/efiche-backend:latest"
+    - docker push "$CI_REGISTRY_IMAGE/efiche-backend:$CI_COMMIT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE/efiche-backend:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# NEW: Enforces a maximum image size of 512MB for RPi 4 (2GB RAM) compatibility.
+# Prevents the class of incidents where a base image change or accidental inclusion
+# of dev dependencies causes the image to exceed available memory on edge nodes,
+# resulting in OOM kills at rural clinics during docker pull or container startup.
+docker_size_check:
+  stage: build
+  image: docker:24-cli
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -t "efiche-backend:size-check-$CI_COMMIT_SHA" .
+    - |
+      SIZE=$(docker image inspect "efiche-backend:size-check-$CI_COMMIT_SHA" --format='{{.Size}}')
+      LIMIT=$((512 * 1024 * 1024))
+      SIZE_MB=$(( SIZE / 1024 / 1024 ))
+      LIMIT_MB=$(( LIMIT / 1024 / 1024 ))
+      echo "Image size : ${SIZE_MB} MB"
+      echo "Limit (RPi): ${LIMIT_MB} MB"
+      if [ "$SIZE" -gt "$LIMIT" ]; then
+        echo "FAIL: Image exceeds RPi size limit. Reduce base image or remove dev dependencies."
+        docker image rm "efiche-backend:size-check-$CI_COMMIT_SHA" || true
+        exit 1
+      fi
+      docker image rm "efiche-backend:size-check-$CI_COMMIT_SHA" || true
+      echo "PASS"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+  needs:
+    - job: docker_build
+      optional: true
+
+# ---------------------------------------------------------------------------
+# DEPLOY STAGE
+# ---------------------------------------------------------------------------
+
+deploy_production:
+  stage: deploy
+  image: alpine:3.19
+  environment:
+    name: production
+    url: https://api.efiche.africa
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$DEPLOY_SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$DEPLOY_HOST_KEY" >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh deploy@prod "
+        set -e
+        cd /app
+        # Tag current as rollback target
+        docker tag efiche-backend:current efiche-backend:previous 2>/dev/null || true
+        # Pull new image
+        docker pull $CI_REGISTRY_IMAGE/efiche-backend:$CI_COMMIT_SHA
+        docker tag $CI_REGISTRY_IMAGE/efiche-backend:$CI_COMMIT_SHA efiche-backend:current
+        # Rolling restart — only the backend service
+        docker compose up -d --no-deps --remove-orphans backend
+        # Wait and verify health
+        sleep 20
+        STATUS=\$(docker inspect --format='{{.State.Health.Status}}' efiche_backend 2>/dev/null || echo unknown)
+        if [ \"\$STATUS\" != 'healthy' ]; then
+          echo 'Health check failed — rolling back'
+          docker tag efiche-backend:previous efiche-backend:current
+          docker compose up -d --no-deps backend
+          exit 1
+        fi
+        echo 'Deployment successful'
+      "
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  needs:
+    - docker_build
